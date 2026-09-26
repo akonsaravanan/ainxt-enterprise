@@ -69,9 +69,27 @@ export function parseMemoryTag(content) {
 // to the user — they're internal routing signals.
 export function stripSystemPrefix(content) {
   if (!content) return content;
-  return content
+  let out = content
     .replace(/^\[(STYLE INSTRUCTION|CONTEXT):[^\]]*\]\n\n?/g, "")
     .trimStart();
+  // Agent/skill system-prompt injection (gateway.py STEP 1a) prepends
+  // "[AGENT INSTRUCTIONS — follow exactly]" / "[ACTIVE SKILL — …]" blocks
+  // (the agent's or skill's full instructions) ahead of the user's actual
+  // message, then marks where the real question starts with a literal
+  // "[USER QUESTION]\n" line. `safe_question` — used for both the LLM call
+  // AND what gets persisted for this turn — deliberately includes all of
+  // that (so retrieval/follow-up condensation can see what instructions
+  // were active), but a user's own chat bubble should only ever show what
+  // they actually typed. Keep only what follows the LAST such marker —
+  // same "find the real boundary, keep what's after it" approach already
+  // used by stripAttachmentContext's "User question:" handling below, just
+  // for this newer wrapper shape.
+  const uqMarker = "[USER QUESTION]\n";
+  const uqIdx = out.lastIndexOf(uqMarker);
+  if (uqIdx !== -1) {
+    out = out.slice(uqIdx + uqMarker.length);
+  }
+  return out;
 }
 
 // Recover the user's actual question from a persisted USER message that had

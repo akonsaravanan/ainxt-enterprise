@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Marketplace local data store — UI-first phase.
+// Marketplace local data store.
 //
 // This Marketplace is a fresh, standalone feature: it does not read from or
 // write to any pre-existing skill/connector/plugin system in this codebase
@@ -7,12 +7,15 @@
 // connector_definitions, not curated_plugins.json, not anything Agent Studio
 // uses). None of those are touched by this file or by Marketplace.jsx.
 //
-// Until a real backend for THIS feature is built, everything created through
-// the Marketplace UI is persisted to localStorage in the shape a future API
-// would return. Every function here is already the "data layer" contract
-// (list/get/create/update/remove) a real fetch()-based version would have —
-// swapping the bodies for HTTP calls later shouldn't require touching any
-// caller in Marketplace.jsx.
+// Skills are now backed by a real API (see skillsApi below) — routers/
+// marketplace_skills_router.py + db.models.MarketplaceSkillRecord. Connectors
+// and Plugins are still UI-first: everything created through those two tabs
+// is persisted to localStorage in the shape a future API would return, via
+// the same list/get/create/update/remove contract skillsApi already uses for
+// real, so swapping their bodies for HTTP calls later shouldn't require
+// touching any caller in Marketplace.jsx.
+
+import { API_BASE as API, authFetch } from "./config.js";
 
 const KEYS = {
   skills: "ainxt.marketplace2.skills",
@@ -36,6 +39,28 @@ export const SKILL_CATEGORIES = [
   "HR", "Support", "Productivity", "Data & Analytics", "Design", "Other",
 ];
 export const CONNECTOR_CATEGORIES = ["Productivity", "Communication", "Developer Tools", "CRM", "Data", "Other"];
+
+// Mirrors services/marketplace_skill_ingestion.py's MIT_COMPATIBLE_LICENSES
+// keys — display-only (the backend is the actual enforcement point, both at
+// ingestion and again at install time); used here just to distinguish "no
+// license on file" from "a license is on file but it isn't one we recognize
+// as MIT-compatible" in the UI, since those are different, honest messages.
+export const MIT_COMPATIBLE_LICENSE_IDS = ["MIT", "Apache-2.0", "BSD-3-Clause", "BSD-2-Clause", "ISC"];
+
+// A third-party skill is usable only with a license we can positively verify
+// as MIT-compatible — missing and incompatible are both "no", not just
+// incompatible. Internal (non-third-party) skills have no upstream license
+// to be compatible with, so this only ever applies when item.thirdParty —
+// AND only when it's genuinely externally-sourced (source !== "internal").
+// The 6 demo seed skills are flagged thirdParty=true purely so the
+// legal-check-modal flow has something to demo, but source="internal"
+// (AiNxt-authored, no real upstream license) — gating on thirdParty alone
+// made them permanently uninstallable once this check went live, which is
+// the wrong call for AiNxt's own demo content.
+export function isSkillLicenseUsable(item) {
+  return !item.thirdParty || item.source === "internal"
+    || (!!item.license && MIT_COMPATIBLE_LICENSE_IDS.includes(item.license));
+}
 
 // ── SKILL.md format ────────────────────────────────────────────────────────
 // Modelled on the same shape Claude's own Agent Skills use: a YAML
@@ -85,7 +110,9 @@ export function parseSkillMarkdown(raw) {
   // Plain human-readable names ("Weekly status report") are valid — Claude's
   // own skill names aren't slugs, so this only rejects an empty value.
   if (!fm.name) errors.push('Missing required frontmatter field: "name".');
+  else if (fm.name.length > 64) errors.push(`"name" must be 64 characters or fewer (this is ${fm.name.length}) — matches the real SKILL.md spec.`);
   if (!fm.description) errors.push('Missing required frontmatter field: "description".');
+  else if (fm.description.length > 200) errors.push(`"description" must be 200 characters or fewer (this is ${fm.description.length}) — matches the real SKILL.md spec.`);
   if (!body || !body.trim()) errors.push("No instructions found in the file body (the markdown content below the closing --- ).");
 
   if (errors.length) return { valid: false, errors };
@@ -137,11 +164,90 @@ function makeCrud(key, defaults) {
   };
 }
 
-export const skillsStore = makeCrud(KEYS.skills, { tags: [], instructions: "", files: [] });
 export const connectorsStore = makeCrud(KEYS.connectors, { tags: [], authType: "api_key", baseUrl: "" });
 export const pluginsStore = makeCrud(KEYS.plugins, { tags: [], skillIds: [], connectorIds: [] });
 
-const STORE_BY_KIND = { skill: skillsStore, connector: connectorsStore, plugin: pluginsStore };
+// ── Skills: real backend (routers/marketplace_skills_router.py) ───────────
+// Async, unlike connectorsStore/pluginsStore above — every call can fail
+// (network/auth/validation/the Phase 4 security gate), so every function
+// here throws on a non-ok response and the caller (Marketplace.jsx) is
+// expected to catch and toast.error(...), a path that plain localStorage
+// never needed.
+async function _errMessage(res, fallback) {
+  try {
+    const data = await res.json();
+    if (typeof data.detail === "string") return data.detail;
+    // FastAPI's own 422 validation errors return `detail` as an array of
+    // {msg, loc, ...} objects, not a string — stringify those sensibly
+    // rather than letting a toast render "[object Object]".
+    if (Array.isArray(data.detail)) {
+      const msg = data.detail.map((d) => d?.msg || JSON.stringify(d)).join("; ");
+      return msg || fallback;
+    }
+    return fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+export const skillsApi = {
+  async list() {
+    const res = await authFetch(`${API}/marketplace-skills`);
+    if (!res.ok) throw new Error(await _errMessage(res, "Failed to load skills."));
+    const data = await res.json();
+    return data.skills || [];
+  },
+  async get(id) {
+    const res = await authFetch(`${API}/marketplace-skills/${id}`);
+    if (!res.ok) throw new Error(await _errMessage(res, "Failed to load skill."));
+    return res.json();
+  },
+  async create(data) {
+    const res = await authFetch(`${API}/marketplace-skills`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    });
+    if (!res.ok) throw new Error(await _errMessage(res, "Failed to create skill."));
+    return res.json();
+  },
+  async update(id, data) {
+    const res = await authFetch(`${API}/marketplace-skills/${id}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    });
+    if (!res.ok) throw new Error(await _errMessage(res, "Failed to update skill."));
+    return res.json();
+  },
+  async remove(id) {
+    const res = await authFetch(`${API}/marketplace-skills/${id}`, { method: "DELETE" });
+    if (!res.ok) throw new Error(await _errMessage(res, "Failed to delete skill."));
+    return res.json();
+  },
+  async upload(entries) {
+    const res = await authFetch(`${API}/marketplace-skills/upload`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ skills: entries }),
+    });
+    if (!res.ok) throw new Error(await _errMessage(res, "Failed to upload skills."));
+    const data = await res.json();
+    return data.skills || [];
+  },
+  async install(id) {
+    const res = await authFetch(`${API}/marketplace-skills/${id}/install`, { method: "POST" });
+    if (!res.ok) throw new Error(await _errMessage(res, "Failed to enable this skill for chat."));
+    return res.json();
+  },
+  async uninstall(id) {
+    const res = await authFetch(`${API}/marketplace-skills/${id}/install`, { method: "DELETE" });
+    if (!res.ok) throw new Error(await _errMessage(res, "Failed to remove this skill from chat."));
+    return res.json();
+  },
+};
+
+const STORE_BY_KIND = { connector: connectorsStore, plugin: pluginsStore };
 export function storeFor(kind) { return STORE_BY_KIND[kind]; }
 
 function readInstalled() {
@@ -178,12 +284,10 @@ export function toggleInstalled(kind, id) {
 // Real user-created items always get random ids (see makeCrud/uid above), so
 // they never collide with these and are never touched by this refresh.
 //
-// Skills below are marked `thirdParty: true` with invented, non-real vendor
-// names (deliberately not real companies — see the "Skills from third
-// parties" section in Marketplace.jsx, whose legal/compatibility check
-// modal assumes an unaffiliated outside publisher). Connectors/plugins are
-// still plain "AiNxt Team" first-party examples for now — the yours/
-// third-party split hasn't been extended to those tabs yet.
+// Skills seeding moved server-side (see routers/marketplace_skills_router.py
+// seed_marketplace_skills(), same stable ids) now that Skills has a real
+// backend — only Connectors/Plugins are still seeded here, since those tabs
+// stay on localStorage for now.
 function upsertSeed(store, id, data) {
   const existing = store.get(id);
   if (existing) {
@@ -197,49 +301,6 @@ function upsertSeed(store, id, data) {
 function refreshSeedData() {
   const daysAgo = (n) => Date.now() - n * 86400000;
   const team = "AiNxt Team";
-
-  upsertSeed(skillsStore, "seed-skill-meeting-notes", {
-    name: "Meeting Notes Summarizer", category: "Productivity", icon: "📝", author: "BrightOps", thirdParty: true, createdAt: daysAgo(2),
-    description: "Turns a raw meeting transcript into a structured summary with decisions and action items.",
-    tags: ["meetings", "summarization"],
-    instructions: "Given a meeting transcript, extract: 1) key decisions, 2) action items with an owner and due date, 3) open questions. Keep the summary under 200 words and use bullet points.",
-    installs: 18,
-  });
-  upsertSeed(skillsStore, "seed-skill-sql-explainer", {
-    name: "SQL Query Explainer", category: "Data & Analytics", icon: "📊", author: "QueryLens", thirdParty: true, createdAt: daysAgo(5),
-    description: "Explains what a SQL query does in plain English, and flags likely performance issues.",
-    tags: ["sql", "data"],
-    instructions: "Given a SQL query, explain step by step what it returns, note any missing indexes or full-table scans, and suggest one concrete optimization if applicable.",
-    installs: 11,
-  });
-  upsertSeed(skillsStore, "seed-skill-contract-clause", {
-    name: "Contract Clause Reviewer", category: "Legal", icon: "🛡️", author: "ClauseGuard", thirdParty: true, createdAt: daysAgo(9),
-    description: "Flags unusual or risky clauses in a contract draft against common enterprise norms.",
-    tags: ["contracts", "risk"],
-    instructions: "Given a contract clause, identify whether it deviates from standard enterprise terms (liability caps, termination notice, indemnity), and explain the risk in one sentence.",
-    installs: 6,
-  });
-  const bugTriager = upsertSeed(skillsStore, "seed-skill-bug-triager", {
-    name: "Bug Report Triager", category: "Engineering", icon: "🧪", author: "BrightOps", thirdParty: true, createdAt: daysAgo(1),
-    description: "Classifies an incoming bug report by severity and suggests the likely owning team.",
-    tags: ["engineering", "triage"],
-    instructions: "Given a bug report, output: severity (P1-P4), likely affected component, and a one-line reproduction summary.",
-    installs: 3,
-  });
-  upsertSeed(skillsStore, "seed-skill-invoice-extractor", {
-    name: "Invoice Data Extractor", category: "Finance", icon: "🧠", author: "LedgerFlow", thirdParty: true, createdAt: daysAgo(6),
-    description: "Pulls vendor, line items, and totals out of an invoice PDF or image into structured fields.",
-    tags: ["finance", "invoices"],
-    instructions: "Given invoice text or OCR output, extract vendor name, invoice number, line items (description, quantity, unit price), and the total due. Flag if the total doesn't match the sum of line items.",
-    installs: 9,
-  });
-  upsertSeed(skillsStore, "seed-skill-sentiment-analyzer", {
-    name: "Customer Sentiment Analyzer", category: "Support", icon: "💡", author: "PulseMetrics", thirdParty: true, createdAt: daysAgo(3),
-    description: "Scores a support ticket or review for sentiment and urgency, and suggests a response tone.",
-    tags: ["support", "sentiment"],
-    instructions: "Given customer text, output: sentiment (positive/neutral/negative), urgency (low/medium/high), and one sentence suggesting the tone of the reply.",
-    installs: 14,
-  });
 
   upsertSeed(connectorsStore, "seed-connector-wiki", {
     name: "Internal Wiki", category: "Productivity", icon: "📁", author: team, createdAt: daysAgo(4),
@@ -263,7 +324,13 @@ function refreshSeedData() {
   upsertSeed(pluginsStore, "seed-plugin-engineering-bundle", {
     name: "Engineering Bundle", category: "Engineering", icon: "🧰", author: team, createdAt: daysAgo(1),
     description: "Everything for daily engineering work: bug triage plus your ticketing system, in one install.",
-    tags: ["engineering"], skillIds: [bugTriager.id], connectorIds: [ticketing.id],
+    // No skillIds here on purpose: Skills now live server-side with real
+    // (Postgres UUID) ids that aren't known at module-load time, unlike the
+    // old localStorage version's stable "seed-skill-*" string ids. Plugins
+    // stays localStorage-only for now (separate future backend phase), so
+    // this bundle just links the connector; a real skill link can be added
+    // once Plugins gets wired to the same real API as Skills.
+    tags: ["engineering"], skillIds: [], connectorIds: [ticketing.id],
     installs: 7,
   });
 }

@@ -280,6 +280,23 @@ services:
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       OPENAI_API_KEY:    ${OPENAI_API_KEY:-}
       GEMINI_API_KEY:    ${GEMINI_API_KEY:-}
+      # Marketplace Skills external ingestion (marketplace_skills_plan.md Phase 3) —
+      # same "compose environment: is an explicit allow-list" reasoning as below;
+      # setting these in .env alone does nothing inside the container without
+      # also listing them here. Only the gateway process runs the ingestion
+      # scheduler, so this doesn't need adding to any worker service.
+      # One line per known source, all defaulting to "false" — turning a site
+      # off (malware report, site unreachable, license policy change, etc.)
+      # is purely a .env edit + `docker compose up -d gateway` restart, never
+      # a code change. See core/config.py's MARKETPLACE_SOURCE_FLAGS for the
+      # matching Layer-1 flag and marketplace_skills_plan.md §3.4 for the
+      # full two-layer (env + DB) design.
+      MARKETPLACE_SKILL_INGESTION_ENABLED:            ${MARKETPLACE_SKILL_INGESTION_ENABLED:-false}
+      MARKETPLACE_SOURCE_ANTHROPIC_SKILLS_ENABLED:    ${MARKETPLACE_SOURCE_ANTHROPIC_SKILLS_ENABLED:-false}
+      MARKETPLACE_SOURCE_OPENAI_SKILLS_ENABLED:       ${MARKETPLACE_SOURCE_OPENAI_SKILLS_ENABLED:-false}
+      MARKETPLACE_SOURCE_HUGGINGFACE_SKILLS_ENABLED:  ${MARKETPLACE_SOURCE_HUGGINGFACE_SKILLS_ENABLED:-false}
+      MARKETPLACE_SOURCE_NVIDIA_SKILLS_ENABLED:       ${MARKETPLACE_SOURCE_NVIDIA_SKILLS_ENABLED:-false}
+      MARKETPLACE_SOURCE_COMPOSIO_AWESOME_CLAUDE_SKILLS_ENABLED: ${MARKETPLACE_SOURCE_COMPOSIO_AWESOME_CLAUDE_SKILLS_ENABLED:-false}
       # Model routing is configured in .env, but compose's `environment:` is an
       # explicit allow-list — without these the container silently falls back to
       # the defaults in core/model_registry.py and .env has no effect.

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-import { useState, useMemo, useRef } from "react";
+import { useState, useMemo, useRef, useEffect, useCallback } from "react";
 import { useNavigate } from "react-router-dom";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -8,12 +8,13 @@ import { useToast, useConfirm } from "./ui/DialogProvider.jsx";
 import {
   Search, ChevronDown, ChevronLeft, Check, Plus, ArrowUpDown, X, Trash2, Pencil,
   Upload, FileText, Sparkles, AlertCircle, CheckCircle2,
-  MoreVertical, User, Plug, Info, Download, Eye, Code2,
+  MoreVertical, User, Plug, Info, Download, Eye, Code2, Loader2,
 } from "lucide-react";
 import {
-  skillsStore, connectorsStore, pluginsStore,
+  skillsApi, connectorsStore, pluginsStore,
   isInstalled, toggleInstalled, parseSkillMarkdown, buildSkillMarkdown, SKILL_MD_EXAMPLE,
   SKILL_CATEGORIES, CONNECTOR_CATEGORIES, SKILL_ICONS, CONNECTOR_ICONS, PLUGIN_ICONS,
+  MIT_COMPATIBLE_LICENSE_IDS, isSkillLicenseUsable,
 } from "../marketplaceStore.js";
 
 // Marketplace — a fresh, standalone feature modelled on Claude's Customize
@@ -26,7 +27,7 @@ import {
 // real backend until one is built.
 
 const TABS = [
-  { key: "skills",     label: "Skills",     store: skillsStore,     categories: SKILL_CATEGORIES,     icons: SKILL_ICONS,     accent: "indigo" },
+  { key: "skills",     label: "Skills",     store: null,            categories: SKILL_CATEGORIES,     icons: SKILL_ICONS,     accent: "indigo" },
   { key: "connectors", label: "Connectors", store: connectorsStore, categories: CONNECTOR_CATEGORIES, icons: CONNECTOR_ICONS, accent: "sky" },
   { key: "plugins",    label: "Plugins",    store: pluginsStore,    categories: SKILL_CATEGORIES,     icons: PLUGIN_ICONS,    accent: "violet" },
 ];
@@ -37,6 +38,10 @@ const ACCENT_TEXT = { indigo: "text-indigo-700", sky: "text-sky-700", violet: "t
 const ACCENT_BORDER_HOVER = { indigo: "hover:border-indigo-200", sky: "hover:border-sky-200", violet: "hover:border-violet-200" };
 
 function timeAgo(ts) {
+  // Not-yet-installed third-party skills are browse-cache-only and carry no
+  // real createdAt/updatedAt (nothing has been persisted for them yet — see
+  // services/marketplace_skill_ingestion.py's "browse vs. store" design).
+  if (!ts) return "recently";
   const days = Math.floor((Date.now() - ts) / 86400000);
   if (days <= 0) return "today";
   if (days === 1) return "1 day ago";
@@ -75,15 +80,52 @@ export default function Marketplace({ user }) {
   const [version, setVersion] = useState(0);
   const bump = () => setVersion((v) => v + 1);
 
+  // Item ids with an install/uninstall/accept request currently in flight —
+  // guards double-submission from an impatient double-click (no loading
+  // state before this meant nothing visually stopped a second click from
+  // firing a second request while the first was still pending).
+  const [busyIds, setBusyIds] = useState(() => new Set());
+  const isBusy = (id) => busyIds.has(id);
+  const setItemBusy = (id, busy) => {
+    setBusyIds((prev) => {
+      const next = new Set(prev);
+      if (busy) next.add(id); else next.delete(id);
+      return next;
+    });
+  };
+
+  // ── Skills: real backend, loaded async (Connectors/Plugins stay on the
+  // synchronous localStorage stores below, per Phase 1's scope). ──────────
+  const [skillsItems, setSkillsItems] = useState([]);
+  const [skillsLoading, setSkillsLoading] = useState(true);
+  const [skillsError, setSkillsError] = useState(null);
+
+  const loadSkills = useCallback(async () => {
+    try {
+      const list = await skillsApi.list();
+      setSkillsItems(list);
+      setSkillsError(null);
+    } catch (e) {
+      setSkillsError(e.message || "Failed to load skills.");
+    } finally {
+      setSkillsLoading(false);
+    }
+  }, []);
+
+  useEffect(() => { loadSkills(); }, [loadSkills]);
+
   const tab = TABS.find((t) => t.key === activeTab);
   const kind = singular[activeTab];
 
-  // Re-read on every `version` bump — the store is synchronous localStorage,
-  // so this is the whole "data fetching" story for this feature right now.
-  const items = useMemo(() => tab.store.list(), [tab, version]);
+  // Skills come from the async state above; Connectors/Plugins are still
+  // re-read on every `version` bump from synchronous localStorage.
+  const items = useMemo(
+    () => (activeTab === "skills" ? skillsItems : tab.store.list()),
+    [tab, activeTab, version, skillsItems]
+  );
 
   const isMine = (item) => item.author === myIdentity;
-  const installedFlag = (item) => isInstalled(kind, item.id);
+  const installedFlag = (item) => (activeTab === "skills" ? !!item.installed : isInstalled(kind, item.id));
 
   const scoped = useMemo(
     () => (scope === "discover" ? items : items.filter((i) => isMine(i) || installedFlag(i))),
@@ -117,15 +159,64 @@ export default function Marketplace({ user }) {
   // compatibility check" — UI-only for now, see ThirdPartyCheckModal).
   // Everything else (your own skills, connectors, plugins, removing
   // anything) toggles immediately, same as before.
-  const requestUse = (tabKey, item) => {
-    const k = singular[tabKey];
-    const already = isInstalled(k, item.id);
-    if (!already && tabKey === "skills" && item.thirdParty) {
-      setLegalCheck({ tabKey, item });
+  const requestUse = async (tabKey, item) => {
+    if (tabKey === "skills") {
+      if (isBusy(item.id)) return;   // request already in flight for this item — ignore the extra click
+      const already = !!item.installed;
+      if (!already && item.thirdParty) {
+        setLegalCheck({ tabKey, item });
+        return;
+      }
+      setItemBusy(item.id, true);
+      try {
+        if (already) await skillsApi.uninstall(item.id);
+        else await skillsApi.install(item.id);
+        await loadSkills();
+      } catch (e) {
+        toast.error(e.message || "Couldn't update this skill's chat availability.");
+      } finally {
+        setItemBusy(item.id, false);
+      }
       return;
     }
+    const k = singular[tabKey];
     toggleInstalled(k, item.id);
     bump();
+  };
+  // Shared by both places ThirdPartyCheckModal can render (the browse-grid
+  // return AND the skill-detail-page return — see the bug-fix comment on
+  // the latter) so "Accept & use" behaves identically either way.
+  const acceptLegalCheck = async () => {
+    if (!legalCheck) return;
+    const id = legalCheck.item.id;
+    if (isBusy(id)) return;   // guards a double-click on "Accept & use" firing two installs
+    if (legalCheck.tabKey === "skills") {
+      setItemBusy(id, true);
+      try {
+        const result = await skillsApi.install(id);
+        await loadSkills();
+        // A skill nobody had installed before this had a synthetic
+        // browse-cache id (see marketplaceStore.js / services/
+        // marketplace_skill_ingestion.py's "browse vs. store" design) —
+        // installing it just gave it a real, permanent id. If its detail
+        // page is open, follow it to the new id so the page doesn't bounce
+        // back to the grid (Marketplace.jsx's detail-lookup treats an
+        // unresolvable id as "gone").
+        if (result?.id && result.id !== id) {
+          setDetail((d) => (d && d.kind === "skills" && d.id === id ? { ...d, id: result.id } : d));
+        }
+        toast.success(`${legalCheck.item.name} is now available in chat.`);
+      } catch (e) {
+        toast.error(e.message || "Couldn't enable this skill for chat.");
+      } finally {
+        setItemBusy(id, false);
+      }
+    } else {
+      toggleInstalled(singular[legalCheck.tabKey], id);
+      bump();
+      toast.success(`${legalCheck.item.name} is now available in chat.`);
+    }
+    setLegalCheck(null);
   };
   const doToggleInstall = (item) => requestUse(activeTab, item);
   // Takes an explicit tabKey rather than closing over `activeTab` — a skill
@@ -140,7 +231,17 @@ export default function Marketplace({ user }) {
       variant: "danger",
     });
     if (!ok) return;
-    TABS.find((t) => t.key === tabKey).store.remove(item.id);
+    if (tabKey === "skills") {
+      try {
+        await skillsApi.remove(item.id);
+        await loadSkills();
+      } catch (e) {
+        toast.error(e.message || "Couldn't delete this skill.");
+        return;
+      }
+    } else {
+      TABS.find((t) => t.key === tabKey).store.remove(item.id);
+    }
     bump();
     setDetail(null);
     toast.success(`${item.name} deleted.`);
@@ -161,38 +262,42 @@ export default function Marketplace({ user }) {
     if (activeTab === "skills") setSkillForm({ existing: null });
     else { setEditItem(null); setCreateOpen(true); }
   };
-  const doSaveSkill = (data, existing) => {
-    let saved;
-    if (existing) {
-      saved = skillsStore.update(existing.id, { ...data, version: (existing.version || 1) + 1 });
-      toast.success(`${data.name} updated.`);
-    } else {
-      saved = skillsStore.create({ ...data, author: myIdentity, thirdParty: false });
-      toast.success(`${data.name} created.`);
+  const doSaveSkill = async (data, existing) => {
+    try {
+      let saved;
+      if (existing) {
+        // Server increments `version` itself now — no client-side bump.
+        saved = await skillsApi.update(existing.id, data);
+        toast.success(`${data.name} updated.`);
+      } else {
+        saved = await skillsApi.create(data);
+        toast.success(`${data.name} created.`);
+      }
+      await loadSkills();
+      setSkillForm(null);
+      // Land on the saved skill's own detail page (not the main grid) — one
+      // step back, not two, and it doubles as immediate visual confirmation
+      // of what was just created/edited.
+      setDetail({ kind: "skills", id: saved.id });
+    } catch (e) {
+      toast.error(e.message || "Couldn't save this skill.");
     }
-    bump();
-    setSkillForm(null);
-    // Land on the saved skill's own detail page (not the main grid) — one
-    // step back, not two, and it doubles as immediate visual confirmation
-    // of what was just created/edited.
-    setDetail({ kind: "skills", id: saved.id });
   };
   // Batch upload — each valid parsed file becomes its own skill (this is why
   // upload is a separate flow from the single-item manual form: one form has
   // one name/description, but a drag-and-drop can carry several unrelated
   // skill files at once).
-  const doUploadSkills = (parsedList) => {
-    parsedList.forEach((p) => {
-      skillsStore.create({
-        name: p.name, description: p.description, instructions: p.instructions,
-        files: p.files || [],
-        category: SKILL_CATEGORIES[0], icon: SKILL_ICONS[0], tags: [],
-        author: myIdentity, thirdParty: false,
-      });
-    });
-    bump();
-    setSkillUploadOpen(false);
-    toast.success(`${parsedList.length} skill${parsedList.length !== 1 ? "s" : ""} uploaded.`);
+  const doUploadSkills = async (parsedList) => {
+    try {
+      await skillsApi.upload(parsedList.map((p) => ({
+        name: p.name, description: p.description, instructions: p.instructions, files: p.files || [],
+      })));
+      await loadSkills();
+      setSkillUploadOpen(false);
+      toast.success(`${parsedList.length} skill${parsedList.length !== 1 ? "s" : ""} uploaded.`);
+    } catch (e) {
+      toast.error(e.message || "Couldn't upload these skills.");
+    }
   };
 
   // ── Full-page: create/edit a skill (manual form) ──────────────────────
@@ -219,20 +324,50 @@ export default function Marketplace({ user }) {
   // ── Full-page detail view ─────────────────────────────────────────────
   if (detail) {
     const dTab = TABS.find((t) => t.key === detail.kind);
-    const item = dTab.store.get(detail.id);
-    if (!item) { setDetail(null); return null; }
+    const item = detail.kind === "skills"
+      ? skillsItems.find((x) => x.id === detail.id)
+      : dTab.store.get(detail.id);
+    if (!item) {
+      // Skills load asynchronously — don't bounce back to the grid while
+      // the list is still loading (e.g. a deep link opened before the
+      // initial fetch resolves); only bail once we know it's really gone.
+      if (detail.kind === "skills" && skillsLoading) {
+        return <div className="flex items-center justify-center h-full text-sm text-gray-400">Loading…</div>;
+      }
+      setDetail(null);
+      return null;
+    }
     const canManageItem = item.author === myIdentity;
     if (detail.kind === "skills") {
+      // BUG FIX: ThirdPartyCheckModal (tied to `legalCheck` state) previously
+      // only rendered in the main "browse" return below — this early return
+      // for the detail page never reached it, so requestUse() would set
+      // legalCheck correctly (verified via direct debugging) but the modal
+      // itself never appeared when "Use in chat" was clicked from a skill's
+      // detail page (only worked from the grid card's own install button).
+      // Pre-existing bug, not introduced by Phases 1-4 — fixed by rendering
+      // the modal as a sibling here too, not just in the main return.
       return (
-        <SkillDetailPage
-          item={item}
-          installed={isInstalled("skill", item.id)}
-          canManage={canManageItem}
-          onBack={() => setDetail(null)}
-          onToggleInstall={() => requestUse("skills", item)}
-          onEdit={() => setSkillForm({ existing: item })}
-          onDelete={() => doDelete("skills", item)}
-        />
+        <>
+          <SkillDetailPage
+            item={item}
+            installed={!!item.installed}
+            canManage={canManageItem}
+            busy={isBusy(item.id)}
+            onBack={() => setDetail(null)}
+            onToggleInstall={() => requestUse("skills", item)}
+            onEdit={() => setSkillForm({ existing: item })}
+            onDelete={() => doDelete("skills", item)}
+          />
+          {legalCheck && (
+            <ThirdPartyCheckModal
+              item={legalCheck.item}
+              busy={isBusy(legalCheck.item.id)}
+              onCancel={() => setLegalCheck(null)}
+              onAccept={acceptLegalCheck}
+            />
+          )}
+        </>
       );
     }
     return (
@@ -241,6 +376,7 @@ export default function Marketplace({ user }) {
         item={item}
         installed={isInstalled(singular[detail.kind], item.id)}
         canManage={canManageItem}
+        allSkills={skillsItems}
         onBack={() => setDetail(null)}
         onToggleInstall={() => requestUse(detail.kind, item)}
         onEdit={() => { setEditItem(item); setCreateOpen(true); }}
@@ -400,11 +536,24 @@ export default function Marketplace({ user }) {
       </div>
 
       <div className="px-6 pb-6 animate-fadeIn">
-        {isBrowsing && activeTab === "skills" ? (
+        {activeTab === "skills" && skillsLoading ? (
+          <div className="flex items-center justify-center h-56 text-sm text-gray-400">Loading skills…</div>
+        ) : activeTab === "skills" && skillsError ? (
+          <div className="flex flex-col items-center justify-center h-56 text-center gap-3">
+            <p className="text-sm text-red-500">{skillsError}</p>
+            <button
+              onClick={loadSkills}
+              className="px-3.5 py-1.5 text-sm bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg transition cursor-pointer"
+            >
+              Retry
+            </button>
+          </div>
+        ) : isBrowsing && activeTab === "skills" ? (
           <SkillsHome
             items={scoped}
             accent={tab.accent}
             myIdentity={myIdentity}
+            busyIds={busyIds}
             onOpen={openDetail}
             onUse={(item) => requestUse("skills", item)}
             onCreate={openCreate}
@@ -415,6 +564,7 @@ export default function Marketplace({ user }) {
             accent={tab.accent}
             items={scoped}
             categories={categories}
+            busyIds={busyIds}
             onOpen={openDetail}
             onToggleInstall={doToggleInstall}
             onPickCategory={setCategory}
@@ -423,7 +573,7 @@ export default function Marketplace({ user }) {
         ) : filtered.length === 0 ? (
           <EmptyState text={`No ${activeTab} match your filters`} onCreate={openCreate} />
         ) : (
-          <ItemGrid tabKey={activeTab} accent={tab.accent} items={filtered} onOpen={openDetail} onToggleInstall={doToggleInstall} />
+          <ItemGrid tabKey={activeTab} accent={tab.accent} items={filtered} busyIds={busyIds} onOpen={openDetail} onToggleInstall={doToggleInstall} />
         )}
       </div>
 
@@ -431,7 +581,7 @@ export default function Marketplace({ user }) {
         <CreateItemModal
           tabKey={activeTab}
           existing={editItem}
-          allSkills={skillsStore.list()}
+          allSkills={skillsItems}
           allConnectors={connectorsStore.list()}
           onClose={() => { setCreateOpen(false); setEditItem(null); }}
           onSave={doSave}
@@ -441,13 +591,9 @@ export default function Marketplace({ user }) {
       {legalCheck && (
         <ThirdPartyCheckModal
           item={legalCheck.item}
+          busy={isBusy(legalCheck.item.id)}
           onCancel={() => setLegalCheck(null)}
-          onAccept={() => {
-            toggleInstalled(singular[legalCheck.tabKey], legalCheck.item.id);
-            bump();
-            toast.success(`${legalCheck.item.name} is now available in chat.`);
-            setLegalCheck(null);
-          }}
+          onAccept={acceptLegalCheck}
         />
       )}
     </div>
@@ -456,7 +602,7 @@ export default function Marketplace({ user }) {
 
 // ── Browse layout (Claude-style: For You / New / Most installed / Categories) ──
 
-function BrowseSections({ tabKey, accent, items, categories, onOpen, onToggleInstall, onPickCategory, onCreate }) {
+function BrowseSections({ tabKey, accent, items, categories, busyIds, onOpen, onToggleInstall, onPickCategory, onCreate }) {
   const kind = singular[tabKey];
   const byRecent = useMemo(() => [...items].sort((a, b) => b.createdAt - a.createdAt), [items]);
   const byInstalls = useMemo(() => [...items].sort((a, b) => (b.installs || 0) - (a.installs || 0)), [items]);
@@ -473,9 +619,9 @@ function BrowseSections({ tabKey, accent, items, categories, onOpen, onToggleIns
 
   return (
     <div className="space-y-8">
-      <SectionRow title="For you" items={forYou} tabKey={tabKey} accent={accent} onOpen={onOpen} onToggleInstall={onToggleInstall} />
-      <SectionRow title={`New ${tabKey}`} items={byRecent.slice(0, 6)} tabKey={tabKey} accent={accent} onOpen={onOpen} onToggleInstall={onToggleInstall} />
-      <SectionRow title="Most installed" items={byInstalls.slice(0, 6)} tabKey={tabKey} accent={accent} onOpen={onOpen} onToggleInstall={onToggleInstall} />
+      <SectionRow title="For you" items={forYou} tabKey={tabKey} accent={accent} busyIds={busyIds} onOpen={onOpen} onToggleInstall={onToggleInstall} />
+      <SectionRow title={`New ${tabKey}`} items={byRecent.slice(0, 6)} tabKey={tabKey} accent={accent} busyIds={busyIds} onOpen={onOpen} onToggleInstall={onToggleInstall} />
+      <SectionRow title="Most installed" items={byInstalls.slice(0, 6)} tabKey={tabKey} accent={accent} busyIds={busyIds} onOpen={onOpen} onToggleInstall={onToggleInstall} />
 
       {categories.length > 0 && (
         <div>
@@ -498,25 +644,25 @@ function BrowseSections({ tabKey, accent, items, categories, onOpen, onToggleIns
   );
 }
 
-function SectionRow({ title, items, tabKey, accent, onOpen, onToggleInstall }) {
+function SectionRow({ title, items, tabKey, accent, busyIds, onOpen, onToggleInstall }) {
   if (items.length === 0) return null;
   return (
     <div>
       <h2 className="text-sm font-semibold text-gray-700 mb-3">{title}</h2>
       <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-3.5">
         {items.map((item) => (
-          <ItemCard key={item.id} tabKey={tabKey} accent={accent} item={item} onOpen={() => onOpen(item.id)} onToggleInstall={() => onToggleInstall(item)} />
+          <ItemCard key={item.id} tabKey={tabKey} accent={accent} item={item} busy={busyIds?.has(item.id)} onOpen={() => onOpen(item.id)} onToggleInstall={() => onToggleInstall(item)} />
         ))}
       </div>
     </div>
   );
 }
 
-function ItemGrid({ tabKey, accent, items, onOpen, onToggleInstall }) {
+function ItemGrid({ tabKey, accent, items, busyIds, onOpen, onToggleInstall }) {
   return (
     <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-3.5">
       {items.map((item) => (
-        <ItemCard key={item.id} tabKey={tabKey} accent={accent} item={item} onOpen={() => onOpen(item.id)} onToggleInstall={() => onToggleInstall(item)} />
+        <ItemCard key={item.id} tabKey={tabKey} accent={accent} item={item} busy={busyIds?.has(item.id)} onOpen={() => onOpen(item.id)} onToggleInstall={() => onToggleInstall(item)} />
       ))}
     </div>
   );
@@ -527,7 +673,7 @@ function ItemGrid({ tabKey, accent, items, onOpen, onToggleInstall }) {
 // Categories BrowseSections above — this replaces that ONLY for Skills, per
 // the current design direction (Skills first, Connectors/Plugins later).
 
-function SkillsHome({ items, accent, myIdentity, onOpen, onUse, onCreate }) {
+function SkillsHome({ items, accent, myIdentity, busyIds, onOpen, onUse, onCreate }) {
   const mine = items.filter((i) => i.author === myIdentity);
   const thirdParty = items.filter((i) => i.thirdParty);
 
@@ -540,7 +686,7 @@ function SkillsHome({ items, accent, myIdentity, onOpen, onUse, onCreate }) {
         ) : (
           <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-3.5">
             {mine.map((item) => (
-              <ItemCard key={item.id} tabKey="skills" accent={accent} item={item} onOpen={() => onOpen(item.id)} onToggleInstall={() => onUse(item)} />
+              <ItemCard key={item.id} tabKey="skills" accent={accent} item={item} busy={busyIds?.has(item.id)} onOpen={() => onOpen(item.id)} onToggleInstall={() => onUse(item)} />
             ))}
           </div>
         )}
@@ -556,7 +702,7 @@ function SkillsHome({ items, accent, myIdentity, onOpen, onUse, onCreate }) {
         ) : (
           <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-3.5">
             {thirdParty.map((item) => (
-              <ItemCard key={item.id} tabKey="skills" accent={accent} item={item} onOpen={() => onOpen(item.id)} onToggleInstall={() => onUse(item)} />
+              <ItemCard key={item.id} tabKey="skills" accent={accent} item={item} busy={busyIds?.has(item.id)} onOpen={() => onOpen(item.id)} onToggleInstall={() => onUse(item)} />
             ))}
           </div>
         )}
@@ -582,10 +728,15 @@ function EmptyState({ text, onCreate }) {
 
 // ── Cards ─────────────────────────────────────────────────────────────────
 
-function ItemCard({ tabKey, accent, item, onOpen, onToggleInstall }) {
+function ItemCard({ tabKey, accent, item, busy, onOpen, onToggleInstall }) {
   const kind = singular[tabKey];
-  const added = isInstalled(kind, item.id);
-  const useTitle = tabKey === "skills"
+  const added = tabKey === "skills" ? !!item.installed : isInstalled(kind, item.id);
+  const licenseBlocked = tabKey === "skills" && !added && !isSkillLicenseUsable(item);
+  const useTitle = busy
+    ? "Working…"
+    : licenseBlocked
+    ? "No verified MIT-compatible license on file — this skill can't be used in chat"
+    : tabKey === "skills"
     ? (added ? "Remove from chat" : "Use in chat")
     : (added ? "Remove from Yours" : "Add to Yours");
   return (
@@ -600,13 +751,17 @@ function ItemCard({ tabKey, accent, item, onOpen, onToggleInstall }) {
         <div className="flex items-start justify-between gap-2">
           <h3 className={`font-semibold text-sm text-gray-900 truncate group-hover:${ACCENT_TEXT[accent]} transition-colors`}>{item.name}</h3>
           <button
-            onClick={(e) => { e.stopPropagation(); onToggleInstall(); }}
+            onClick={(e) => { e.stopPropagation(); if (!licenseBlocked && !busy) onToggleInstall(); }}
             title={useTitle}
-            className={`w-7 h-7 rounded-full flex items-center justify-center flex-shrink-0 transition-all duration-150 cursor-pointer ${
-              added ? "bg-green-500 hover:bg-green-600 text-white" : "bg-gray-100 hover:bg-indigo-100 hover:text-indigo-600 border border-gray-200 text-gray-500"
+            disabled={licenseBlocked || busy}
+            className={`w-7 h-7 rounded-full flex items-center justify-center flex-shrink-0 transition-all duration-150 ${
+              licenseBlocked ? "bg-gray-50 border border-gray-200 text-gray-300 cursor-not-allowed"
+              : busy ? "bg-gray-100 border border-gray-200 text-gray-400 cursor-wait"
+              : added ? "bg-green-500 hover:bg-green-600 text-white cursor-pointer"
+              : "bg-gray-100 hover:bg-indigo-100 hover:text-indigo-600 border border-gray-200 text-gray-500 cursor-pointer"
             }`}
           >
-            {added ? <Check className="w-3.5 h-3.5" /> : <Plus className="w-3.5 h-3.5" />}
+            {busy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : added ? <Check className="w-3.5 h-3.5" /> : <Plus className="w-3.5 h-3.5" />}
           </button>
         </div>
         <p className="text-xs text-gray-500 mt-0.5 line-clamp-2">{item.description}</p>
@@ -614,6 +769,17 @@ function ItemCard({ tabKey, accent, item, onOpen, onToggleInstall }) {
           <span className="text-[10px] px-1.5 py-0.5 rounded bg-gray-100 text-gray-500 font-medium">{item.category}</span>
           {item.thirdParty && (
             <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-50 text-amber-700 font-medium">Third-party</span>
+          )}
+          {item.securityStatus === "caution" && (
+            <span className="text-[10px] px-1.5 py-0.5 rounded bg-orange-50 text-orange-700 font-medium">⚠ Review flagged</span>
+          )}
+          {item.securityStatus === "blocked" && (
+            <span className="text-[10px] px-1.5 py-0.5 rounded bg-red-50 text-red-700 font-medium">⛔ Blocked</span>
+          )}
+          {item.thirdParty && !isSkillLicenseUsable(item) && (
+            <span className="text-[10px] px-1.5 py-0.5 rounded bg-red-50 text-red-700 font-medium">
+              ⛔ {item.license ? "License incompatible" : "No license on file"}
+            </span>
           )}
           <span className="text-[11px] text-gray-400 truncate">by {item.author} · {item.installs || 0} installs</span>
         </div>
@@ -624,10 +790,10 @@ function ItemCard({ tabKey, accent, item, onOpen, onToggleInstall }) {
 
 // ── Full-page detail ─────────────────────────────────────────────────────
 
-function DetailPage({ tabKey, item, installed, canManage, onBack, onToggleInstall, onEdit, onDelete, onOpenLinked }) {
+function DetailPage({ tabKey, item, installed, canManage, allSkills, onBack, onToggleInstall, onEdit, onDelete, onOpenLinked }) {
   const accent = TABS.find((t) => t.key === tabKey).accent;
   const kind = singular[tabKey];
-  const linkedSkills = kind === "plugin" ? (item.skillIds || []).map((id) => skillsStore.get(id)).filter(Boolean) : [];
+  const linkedSkills = kind === "plugin" ? (item.skillIds || []).map((id) => (allSkills || []).find((s) => s.id === id)).filter(Boolean) : [];
   const linkedConnectors = kind === "plugin" ? (item.connectorIds || []).map((id) => connectorsStore.get(id)).filter(Boolean) : [];
 
   return (
@@ -753,20 +919,22 @@ function DetailPage({ tabKey, item, installed, canManage, onBack, onToggleInstal
 // deliberate separate step — the "⋮" menu or the Contents tab's own Edit
 // button — never the click-to-open action itself.
 
-function ToggleSwitch({ on, onClick, disabled, title }) {
+function ToggleSwitch({ on, onClick, disabled, busy, title }) {
   return (
     <button
-      onClick={onClick}
-      disabled={disabled}
-      title={title}
+      onClick={busy ? undefined : onClick}
+      disabled={disabled || busy}
+      title={busy ? "Working…" : title}
       className={`relative w-9 h-5 rounded-full transition-colors flex-shrink-0 cursor-pointer disabled:cursor-default disabled:opacity-40 ${on ? "bg-indigo-600" : "bg-gray-200"}`}
     >
-      <span className={`absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full shadow transition-transform ${on ? "translate-x-4" : "translate-x-0"}`} />
+      {busy
+        ? <Loader2 className="absolute top-0.5 left-0.5 w-4 h-4 text-gray-400 animate-spin" />
+        : <span className={`absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full shadow transition-transform ${on ? "translate-x-4" : "translate-x-0"}`} />}
     </button>
   );
 }
 
-function SkillDetailPage({ item, installed, canManage, onBack, onToggleInstall, onEdit, onDelete }) {
+function SkillDetailPage({ item, installed, canManage, busy, onBack, onToggleInstall, onEdit, onDelete }) {
   const [tab, setTab] = useState("overview"); // "overview" | "contents"
   const [contentView, setContentView] = useState("preview"); // "preview" | "raw"
   const [menuOpen, setMenuOpen] = useState(false);
@@ -811,6 +979,18 @@ function SkillDetailPage({ item, installed, canManage, onBack, onToggleInstall, 
                 <h1 className="text-lg font-bold text-gray-900 truncate">{item.name}</h1>
                 {isNew && <span className="px-2 py-0.5 text-[10px] font-semibold bg-blue-100 text-blue-700 rounded flex-shrink-0">New</span>}
                 {item.thirdParty && <span className="px-2 py-0.5 text-[10px] font-semibold bg-amber-50 text-amber-700 rounded flex-shrink-0">Third-party</span>}
+                {item.securityStatus === "caution" && (
+                  <span title="This skill's content triggered a security review flag — check the instructions before use." className="px-2 py-0.5 text-[10px] font-semibold bg-orange-50 text-orange-700 rounded flex-shrink-0">⚠ Review flagged</span>
+                )}
+                {item.securityStatus === "blocked" && (
+                  <span title="This skill failed a security review and cannot be used in chat." className="px-2 py-0.5 text-[10px] font-semibold bg-red-50 text-red-700 rounded flex-shrink-0">⛔ Blocked</span>
+                )}
+                {item.thirdParty && !isSkillLicenseUsable(item) && (
+                  <span title={item.license ? `Licensed under ${item.license} — not compatible with this project's MIT license.` : "No verified license on file for this skill — it can't be used in chat."}
+                    className="px-2 py-0.5 text-[10px] font-semibold bg-red-50 text-red-700 rounded flex-shrink-0">
+                    ⛔ {item.license ? "License incompatible" : "No license on file"}
+                  </span>
+                )}
               </div>
               <p className="text-xs text-gray-400 mt-0.5">
                 by {canManage ? "you" : item.author} · v{item.version || 1} · updated {timeAgo(item.updatedAt)}
@@ -818,7 +998,11 @@ function SkillDetailPage({ item, installed, canManage, onBack, onToggleInstall, 
             </div>
           </div>
           <div className="flex items-center gap-3 flex-shrink-0">
-            <ToggleSwitch on={installed} onClick={onToggleInstall} title={installed ? "Remove from chat" : "Use in chat"} />
+            <ToggleSwitch on={installed} onClick={onToggleInstall} busy={busy}
+              disabled={item.securityStatus === "blocked" || !isSkillLicenseUsable(item)}
+              title={item.securityStatus === "blocked" ? "Blocked by security review"
+                : !isSkillLicenseUsable(item) ? (item.license ? "Blocked — license incompatible with this project's MIT license" : "Blocked — no verified license on file for this skill")
+                : (installed ? "Remove from chat" : "Use in chat")} />
             {canManage && (
               <div className="relative">
                 <button onClick={() => setMenuOpen((v) => !v)} className="p-1.5 rounded-lg text-gray-400 hover:text-gray-600 hover:bg-gray-100 transition cursor-pointer">
@@ -1048,10 +1232,18 @@ function SkillFormPage({ existing, onCancel, onSave }) {
   const updateFileContent = (fileName, content) =>
     setFiles((prev) => prev.map((f) => (f.name === fileName ? { ...f, content } : f)));
 
-  const canSave = name.trim() && description.trim() && instructions.trim();
+  // Real SKILL.md spec limits (per Anthropic's docs): name <= 64 chars,
+  // description <= 200 chars — description is the only signal the model
+  // uses to decide whether a skill is relevant, so it's kept short on purpose.
+  const canSave = name.trim() && name.trim().length <= 64 && description.trim() && description.trim().length <= 200 && instructions.trim();
 
   const submit = () => {
-    if (!canSave) { setFormError("Skill name, description and instructions are all required."); return; }
+    if (!name.trim() || !description.trim() || !instructions.trim()) {
+      setFormError("Skill name, description and instructions are all required.");
+      return;
+    }
+    if (name.trim().length > 64) { setFormError(`Skill name must be 64 characters or fewer (currently ${name.trim().length}).`); return; }
+    if (description.trim().length > 200) { setFormError(`Description must be 200 characters or fewer (currently ${description.trim().length}).`); return; }
     onSave({
       name: name.trim(),
       description: description.trim(),
@@ -1071,7 +1263,6 @@ function SkillFormPage({ existing, onCancel, onSave }) {
         </button>
         <h1 className="text-xl font-bold text-gray-900">{existing ? "Edit skill" : "Create a skill"}</h1>
         <p className="text-sm text-gray-500 mt-1">
-          Saved to your browser for now — this becomes a real save-to-backend call once this feature's API exists.
           Have several ready-made <code className="bg-gray-100 px-1 rounded">SKILL.md</code> files? Use{" "}
           <span className="text-gray-700 font-medium">Add → Upload skill</span> instead.
         </p>
@@ -1088,18 +1279,24 @@ function SkillFormPage({ existing, onCancel, onSave }) {
         </div>
 
         <div>
-          <label className="block text-sm font-semibold text-gray-800 mb-1.5">Skill name</label>
-          <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Weekly status report"
+          <div className="flex items-center justify-between">
+            <label className="block text-sm font-semibold text-gray-800 mb-1.5">Skill name</label>
+            <span className={`text-xs ${name.length > 64 ? "text-red-500" : "text-gray-400"}`}>{name.length}/64</span>
+          </div>
+          <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Weekly status report" maxLength={64}
             className="w-full px-3 py-2.5 border border-gray-200 rounded-lg text-sm outline-none focus:ring-2 focus:ring-indigo-100 focus:border-indigo-400 transition" />
         </div>
 
         <div>
-          <label className="block text-sm font-semibold text-gray-800 mb-1.5">Description</label>
+          <div className="flex items-center justify-between">
+            <label className="block text-sm font-semibold text-gray-800 mb-1.5">Description</label>
+            <span className={`text-xs ${description.length > 200 ? "text-red-500" : "text-gray-400"}`}>{description.length}/200</span>
+          </div>
           <p className="text-xs text-gray-400 mb-1.5">
             Header field. One line: what this does and when to use it — this is what the model checks to decide
             whether this skill applies. Not the steps themselves; those go in Instructions below.
           </p>
-          <textarea value={description} onChange={(e) => setDescription(e.target.value)} rows={2}
+          <textarea value={description} onChange={(e) => setDescription(e.target.value)} rows={2} maxLength={200}
             placeholder="Generate weekly status reports from recent work. Use when asked for updates or progress summaries."
             className="w-full px-3 py-2.5 border border-gray-200 rounded-lg text-sm outline-none focus:ring-2 focus:ring-indigo-100 focus:border-indigo-400 transition resize-none" />
         </div>
@@ -1696,18 +1893,45 @@ function CreateItemModal({ tabKey, existing, allSkills, allConnectors, onClose, 
 
 // ── Third-party legal & compatibility check ─────────────────────────────
 // Shown the first time you "use" a third-party skill (not on removal, and
-// never for skills you created yourself). UI-only for now — every check
-// below is a static, always-passing placeholder; this is the seam where a
-// real legal/security/compatibility review would plug in once this feature
-// has a backend.
+// never for skills you created yourself). Reflects REAL data from the
+// backend (routers/marketplace_skills_router.py's `license`/`securityStatus`
+// fields, backed by services/marketplace_skill_ingestion.py's real license
+// classification and services/skill_security_scan.py's real content scan) —
+// this is no longer a static always-passing placeholder. Only shown for
+// skills this router's `install` endpoint would actually allow; a skill
+// whose scan resolved to "blocked" never reaches this modal in the first
+// place (the "Use in chat" toggle itself is disabled for those, per
+// SkillDetailPage/ItemCard).
 
-function ThirdPartyCheckModal({ item, onCancel, onAccept }) {
-  const checks = [
-    { label: "License compatibility", detail: "Compatible with your organization's usage terms." },
-    { label: "Data & privacy review", detail: "No data is shared with the publisher without your explicit action." },
-    { label: "Security review", detail: "No known vulnerabilities reported for this skill." },
-    { label: "Version compatibility", detail: "Compatible with your current AiNxt platform version." },
-  ];
+function ThirdPartyCheckModal({ item, busy, onCancel, onAccept }) {
+  // Four real states, not just yes/no:
+  // - source === "internal" (the 6 demo seed skills — flagged thirdParty
+  //   for this modal to have something to demo, but actually authored by
+  //   AiNxt, not sourced from any external license at all) — always fine.
+  // - a genuinely MIT-compatible license on file (green).
+  // - a license IS on file but isn't one this project recognizes as
+  //   compatible with its own MIT license (red — should be rare, since
+  //   ingestion already filters these out before they ever reach the
+  //   catalog, but the install endpoint re-checks this defensively too).
+  // - no license on file at all for real external content (amber, blocks
+  //   install — matches isSkillLicenseUsable()'s "missing counts as no").
+  const isInternalSource = item.source === "internal";
+  const licenseCompatible = isInternalSource || (!!item.license && MIT_COMPATIBLE_LICENSE_IDS.includes(item.license));
+  const licenseIncompatibleOnFile = !isInternalSource && !!item.license && !licenseCompatible;
+  const security = item.securityStatus || "unscanned";
+  const securityMeta = {
+    passed:    { tone: "green",  label: "No issues found", detail: "Our automated content scan found no prompt-injection, exfiltration, or destructive-action patterns in this skill's instructions." },
+    caution:   { tone: "amber",  label: "Review flagged",  detail: "Our automated scan flagged something worth a second look — read the skill's full instructions (Contents tab) before relying on it." },
+    blocked:   { tone: "red",    label: "Blocked",          detail: "This skill failed our automated security scan and cannot be used in chat." },
+    unscanned: { tone: "gray",   label: "Not yet scanned",  detail: "This skill hasn't been through our automated security scan yet." },
+  }[security] || { tone: "gray", label: security, detail: "" };
+  const toneClasses = {
+    green: "bg-green-50 border-green-100 text-green-600",
+    amber: "bg-amber-50 border-amber-100 text-amber-600",
+    red:   "bg-red-50 border-red-100 text-red-600",
+    gray:  "bg-gray-50 border-gray-100 text-gray-500",
+  };
+
   return (
     <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4">
       <div className="bg-white rounded-2xl shadow-xl p-6 w-full max-w-md">
@@ -1719,24 +1943,45 @@ function ThirdPartyCheckModal({ item, onCancel, onAccept }) {
           </div>
         </div>
         <p className="text-xs text-gray-500 mt-3 mb-4">
-          This skill is published by a third party, not AiNxt. Before it becomes available anywhere you chat, here's
-          what we checked. <span className="text-gray-400">(UI preview — these checks run for real once this feature has a backend.)</span>
+          {isInternalSource
+            ? "This skill is published by AiNxt itself, not an outside vendor. Here's what we actually checked before letting you use it."
+            : "This skill is published by a third party, not AiNxt. Here's what we actually checked before letting you use it."}
         </p>
-        <div className="space-y-2 mb-5">
-          {checks.map((c) => (
-            <div key={c.label} className="flex items-start gap-2.5 p-2.5 bg-green-50 border border-green-100 rounded-lg">
-              <Check className="w-4 h-4 text-green-600 flex-shrink-0 mt-0.5" />
-              <div className="min-w-0">
-                <div className="text-sm font-medium text-gray-800">{c.label}</div>
-                <div className="text-xs text-gray-500">{c.detail}</div>
+        <div className="space-y-2 mb-3">
+          <div className={`flex items-start gap-2.5 p-2.5 border rounded-lg ${toneClasses[licenseCompatible ? "green" : licenseIncompatibleOnFile ? "red" : "amber"]}`}>
+            <Check className="w-4 h-4 flex-shrink-0 mt-0.5" />
+            <div className="min-w-0">
+              <div className="text-sm font-medium text-gray-800">License</div>
+              <div className="text-xs text-gray-500">
+                {isInternalSource
+                  ? "Published directly by AiNxt — no external license applies, same as anything else built into this platform."
+                  : licenseCompatible
+                  ? <>Sourced under <span className="font-medium">{item.license}</span>{item.source && item.source !== "internal" ? ` from ${item.source}` : ""} — permissively licensed and compatible with this project's MIT license.</>
+                  : licenseIncompatibleOnFile
+                  ? <>Licensed under <span className="font-medium">{item.license}</span> — this is <span className="font-medium">not compatible</span> with this project's MIT license and this skill cannot be used in chat.</>
+                  : "No verified open-source license on file for this skill — treat its instructions as unreviewed third-party content."}
               </div>
             </div>
-          ))}
+          </div>
+          <div className={`flex items-start gap-2.5 p-2.5 border rounded-lg ${toneClasses[securityMeta.tone]}`}>
+            <Check className="w-4 h-4 flex-shrink-0 mt-0.5" />
+            <div className="min-w-0">
+              <div className="text-sm font-medium text-gray-800">Security scan: {securityMeta.label}</div>
+              <div className="text-xs text-gray-500">{securityMeta.detail}</div>
+            </div>
+          </div>
         </div>
+        <p className="text-xs text-gray-400 mb-5">
+          These are automated checks, not a manual audit. We don't inspect what a skill's instructions ask the model to do
+          beyond this scan — review the Contents tab yourself before relying on sensitive skills.
+        </p>
         <div className="flex gap-2 justify-end">
-          <button onClick={onCancel} className="px-4 py-2 text-sm text-gray-500 hover:text-gray-700 cursor-pointer">Cancel</button>
-          <button onClick={onAccept} className="px-4 py-2 text-sm bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg transition cursor-pointer flex items-center gap-1.5">
-            <Check className="w-4 h-4" /> Accept &amp; use
+          <button onClick={onCancel} disabled={busy} className="px-4 py-2 text-sm text-gray-500 hover:text-gray-700 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed">Cancel</button>
+          <button onClick={onAccept} disabled={!licenseCompatible || busy}
+            title={!licenseCompatible ? "This skill has no verified license that's compatible with this project's MIT license — it can't be used in chat" : undefined}
+            className="px-4 py-2 text-sm bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg transition cursor-pointer flex items-center gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed">
+            {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Check className="w-4 h-4" />}
+            {busy ? "Enabling…" : "Accept & use"}
           </button>
         </div>
       </div>

@@ -905,6 +905,26 @@ SKILL_LOOP_WINDOW_SEC        = int(os.getenv("SKILL_LOOP_WINDOW_SEC", "604800"))
 SKILL_LOOP_INTERVAL_SEC      = int(os.getenv("SKILL_LOOP_INTERVAL_SEC", "1800"))    # detector cadence (30 min)
 SKILL_LOOP_MAX_PROPOSALS_PER_RUN = int(os.getenv("SKILL_LOOP_MAX_PROPOSALS_PER_RUN", "3"))  # anti-spam cap per tick
 
+# ── Marketplace Skills — external ingestion (Phase 3 of marketplace_skills_plan.md) ──
+# Two-layer gate, both must allow a source before it's ever fetched:
+#   Layer 1 (here, env, deploy-time): master switch + one named flag per
+#   individually-researched-and-verified marketplace site. Every flag
+#   defaults "false" — nothing is ever fetched from anywhere unless a
+#   deployment explicitly opts in per-site.
+#   Layer 2 (db.models.MarketplaceSourceConfigRecord, runtime, admin-adjustable):
+#   per-source enabled/cadence/license-allowlist/circuit-breaker settings.
+# See marketplace_skills_plan.md §3.4 for the full researched-site table and
+# why each site does or doesn't get a flag.
+MARKETPLACE_SKILL_INGESTION_ENABLED = os.getenv("MARKETPLACE_SKILL_INGESTION_ENABLED", "false").lower() == "true"
+
+MARKETPLACE_SOURCE_FLAGS = {
+    "anthropics/skills":                 os.getenv("MARKETPLACE_SOURCE_ANTHROPIC_SKILLS_ENABLED", "false").lower() == "true",
+    "openai/skills":                     os.getenv("MARKETPLACE_SOURCE_OPENAI_SKILLS_ENABLED", "false").lower() == "true",
+    "huggingface/skills":                os.getenv("MARKETPLACE_SOURCE_HUGGINGFACE_SKILLS_ENABLED", "false").lower() == "true",
+    "NVIDIA/skills":                      os.getenv("MARKETPLACE_SOURCE_NVIDIA_SKILLS_ENABLED", "false").lower() == "true",
+    "ComposioHQ/awesome-claude-skills":   os.getenv("MARKETPLACE_SOURCE_COMPOSIO_AWESOME_CLAUDE_SKILLS_ENABLED", "false").lower() == "true",
+}
+
 # ── Forward Proxy ─────────────────────────────────────────────
 # Routes outbound internet calls to cloud LLM APIs ONLY:
 #   OpenAI, Anthropic, Google — NOT used for the local LLM proxy.
@@ -1258,6 +1278,13 @@ PPT_TEMPLATE_PATH = os.getenv("PPT_TEMPLATE_PATH", _DEFAULT_PPT_TEMPLATE)
 # db=6  chat token streams (SSE via XREAD)
 # db=7  embed svc SHA256 embedding cache
 # db=8  privacy svc PII cache (services/privacy_svc/main.py)
+# db=9  RESERVED — tests/conftest.py's `kv` fixture hard-codes db=9 as its
+#       scratch DB precisely because it's "not in use by the platform"; do
+#       not allocate this one to a real feature, or test runs and real data
+#       start sharing a DB.
+# db=10 marketplace skills third-party browse cache (services/marketplace_skill_ingestion.py) —
+#       deliberately separate DB from db=3's marketplace *registry* (routers/marketplace_router.py,
+#       the pre-existing MCP tool registry this feature must never touch/share with)
 RDB_CACHE    = 0
 RDB_TRACE    = 1
 RDB_WORKFLOW = 2
@@ -1267,11 +1294,14 @@ RDB_QUEUE    = 5
 RDB_STREAM   = 6
 RDB_EMBED    = 7
 RDB_PRIVACY  = 8
+RDB_MARKETPLACE_SKILLS = 10
 
 # Total number of logical KV DBs the platform owns. Anything that iterates
 # over "all KV DBs" (factory.kv_backend_map, /health probe, KV_BACKEND_MAP)
-# uses this constant so adding a new DB only requires bumping it.
-KV_DB_COUNT  = 9
+# uses this constant so adding a new DB only requires bumping it. DB 9 is
+# intentionally skipped (see above) but still counts toward this total so
+# the /health probe still reports on it.
+KV_DB_COUNT  = 11
 
 # ── KV backend selector ──────────────────────────────────────────────────────
 # Each logical DB picks its own backend independently. Resolution order

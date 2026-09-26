@@ -2844,3 +2844,81 @@ class LLMModel(Base):
     created_by   = Column(String(255), nullable=True)
     created_at   = Column(DateTime, nullable=False, default=_now)
     updated_at   = Column(DateTime, nullable=False, default=_now, onupdate=_now)
+
+
+class MarketplaceSkillRecord(Base):
+    """Marketplace 'Skills' tab — standalone from SkillRecord/skills_pg (governance).
+    See ai-ui/src/marketplaceStore.js header for why this is deliberately separate.
+    """
+    __tablename__ = "marketplace_skills_pg"
+    __table_args__ = (
+        # Guards seed_marketplace_skills() against the multi-gunicorn-worker
+        # startup race (each worker's FastAPI startup event calls it
+        # concurrently) — a plain app-level "does this name exist" check has
+        # a TOCTOU gap; this DB-level partial unique index closes it, scoped
+        # to third_party rows only so two different users can still each
+        # create their own skill sharing the same name.
+        Index("uq_marketplace_skills_seed_name", "name", unique=True,
+              postgresql_where=text("third_party = true")),
+    )
+
+    id           = Column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    name         = Column(String(255), nullable=False, index=True)
+    description  = Column(Text, nullable=False, default="")
+    category     = Column(String(100), nullable=True)
+    icon         = Column(String(20), nullable=True)
+    tags         = Column(JSONB, nullable=False, default=list)
+    instructions = Column(Text, nullable=False, default="")
+    files        = Column(JSONB, nullable=False, default=list)   # [{name, content}]
+    version      = Column(Integer, nullable=False, default=1)
+    installs     = Column(Integer, nullable=False, default=0)    # denormalized counter, kept in sync with installs table
+    author       = Column(String(255), nullable=True)
+    created_by   = Column(String(255), nullable=True, index=True)  # current_user["sub"], ownership check
+    department   = Column(String(255), nullable=True)
+    third_party  = Column(Boolean, nullable=False, default=False)  # seed/vendor vs user-created
+    source       = Column(String(50),  nullable=True)   # 'internal' | 'anthropics/skills' | ... (used starting Phase 3)
+    source_ref   = Column(String(500), nullable=True)   # upstream repo path/commit (used starting Phase 3)
+    license      = Column(String(100), nullable=True)   # upstream license id (used starting Phase 3/4)
+    security_status = Column(String(20), nullable=False, default="unscanned")  # unscanned|passed|caution|blocked (used starting Phase 4)
+    created_at   = Column(DateTime, nullable=False, default=_now)
+    updated_at   = Column(DateTime, nullable=False, default=_now, onupdate=_now)
+
+
+class MarketplaceSourceConfigRecord(Base):
+    """Layer-2 (runtime, admin-adjustable) config for external skill ingestion.
+    Layer-1 (env, deploy-time) is core.config.MARKETPLACE_SOURCE_FLAGS — a
+    source only ever gets fetched when BOTH layers allow it. See
+    marketplace_skills_plan.md Phase 3 §3.4.
+    """
+    __tablename__ = "marketplace_source_configs_pg"
+    __table_args__ = (
+        UniqueConstraint("org_login", "repo_name", name="uq_mkt_source_configs_org_repo"),
+    )
+
+    id                    = Column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    org_login             = Column(String(255), nullable=False)   # e.g. "anthropics"
+    org_id                = Column(BigInteger, nullable=False)    # immutable GitHub org id — the real identity check
+    repo_name             = Column(String(255), nullable=False)   # e.g. "skills"
+    enabled               = Column(Boolean, nullable=False, default=False)
+    allowed_licenses      = Column(JSONB, nullable=False, default=list)   # e.g. ["Apache-2.0"]
+    sync_interval_minutes = Column(Integer, nullable=False, default=720)
+    anomaly_threshold_pct = Column(Integer, nullable=False, default=20)
+    last_synced_at        = Column(DateTime, nullable=True)
+    last_sync_status      = Column(String(30), nullable=True)   # ok | halted_anomaly | halted_owner_mismatch | error | disabled
+    created_by            = Column(String(255), nullable=True)
+    updated_at            = Column(DateTime, nullable=False, default=_now, onupdate=_now)
+
+
+class MarketplaceSkillInstallRecord(Base):
+    """Per-user install state for marketplace skills — one row per (user, skill)."""
+    __tablename__ = "marketplace_skill_installs_pg"
+    __table_args__ = (
+        UniqueConstraint("user_id", "skill_id", name="uq_mkt_skill_installs_user_skill"),
+    )
+
+    id           = Column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    user_id      = Column(String(255), nullable=False, index=True)
+    skill_id     = Column(UUID(as_uuid=False),
+                           ForeignKey("marketplace_skills_pg.id", ondelete="CASCADE"),
+                           nullable=False, index=True)
+    installed_at = Column(DateTime, nullable=False, default=_now)

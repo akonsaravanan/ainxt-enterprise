@@ -35,6 +35,8 @@ import {
   Eye,
   AlertTriangle,
   ArrowDown,
+  Plus,
+  Zap,
 } from "lucide-react";
 import MemoryPanel from "./MemoryPanel";
 import ArtifactsPanel from "./ArtifactsPanel";
@@ -67,6 +69,7 @@ import { isKbChat } from '../utils/kbChat.js';
 import { stripMemoryTag, parseMemoryTag, stripSystemPrefix, detectTone, stripAttachmentContext } from '../utils/messageContent.js';
 import { generateImage, IMAGE_ARTIFACT_TITLE } from '../utils/imageGenerate';
 import { validateIdentifier, validateFreeText } from '../utils/securityValidation';
+import { skillsApi } from '../marketplaceStore.js';
 
 // ── extractDurationFromPrompt: parse a desired video duration from natural
 // language. Returns a clamped integer in [min, max], or `fallback` if no
@@ -646,6 +649,103 @@ export default function Chat({
   const [tplFilter, setTplFilter]   = useState("");
   const [tplActiveIdx, setTplActiveIdx] = useState(0);  // Phase 5.2: keyboard-nav highlight
 
+  // ── Marketplace Skills — /skillname invocation + "+" attach picker ───────
+  // Manual-only for v1 (no model-driven auto-invocation): the user must
+  // explicitly type /skillname or pick from the "+" menu. `chatSkills` is
+  // this user's *installed* skills only (fetched once, refreshed on open of
+  // either picker so a skill installed/removed elsewhere shows up without a
+  // full reload). `activeSkillIds` is chat-window-local state — a thin UI
+  // convenience chip list layered on top of the real, global "installed"
+  // state (see marketplace_skills_plan.md Phase 2 §2.3/§2.4); it is NOT a
+  // server-persisted per-conversation concept, just re-sent on every /ask
+  // while the chat window stays open.
+  const [chatSkills, setChatSkills] = useState([]);
+  const [activeSkillIds, setActiveSkillIds] = useState([]);
+  const [attachMenuOpen, setAttachMenuOpen] = useState(false);
+  // Tracks the ONE skill (if any) currently represented by a literal
+  // "/skillname " tag at the start of the input — lets backspacing that
+  // tag away auto-detach it, matching Claude Desktop: typing the tag attaches
+  // it, deleting the tag removes it. Skills attached via the "+" picker
+  // instead (no inserted text) are NOT tracked here — they only come off via
+  // the chip's own "×", same as before.
+  const [slashTaggedSkillId, setSlashTaggedSkillId] = useState(null);
+
+  const loadChatSkills = useCallback(() => {
+    skillsApi.list()
+      .then(list => setChatSkills((list || []).filter(s => s.installed)))
+      .catch(() => setChatSkills([]));
+  }, []);
+  useEffect(() => { loadChatSkills(); }, [loadChatSkills]);
+
+  const activeSkills = chatSkills.filter(s => activeSkillIds.includes(s.id));
+  const attachSkill = (skill) => {
+    setActiveSkillIds(prev => prev.includes(skill.id) ? prev : [...prev, skill.id]);
+    setAttachMenuOpen(false);
+  };
+  const removeActiveSkill = (skillId) => {
+    setActiveSkillIds(prev => prev.filter(id => id !== skillId));
+    if (slashTaggedSkillId === skillId) setSlashTaggedSkillId(null);
+  };
+
+  // Recognizes "/skillname" typed out by hand at the very start of the
+  // input, without requiring the user to ever open/pick from the "/" menu —
+  // real Claude Code/Desktop treats typing the full command yourself the
+  // same as picking it from a menu. Compared against each installed
+  // skill's FULL name (not a `\S+`-style single-token regex) since several
+  // internal skills have multi-word names with spaces ("Bug Report
+  // Triager") — a token-based match would never see past the first space
+  // and could never recognize those. `requireTrailingSpace=true` (live
+  // typing) only matches once a delimiter confirms the name is complete,
+  // so "/pdf" typed toward a longer "/pdf-export" doesn't momentarily
+  // attach the wrong (shorter, prefix-matching) skill mid-keystroke; at
+  // send time the message is already final, so end-of-string is also a
+  // valid boundary. Prefers the LONGEST matching name when more than one
+  // installed skill's name is a prefix of what's typed (same reasoning).
+  function matchLeadingSkillSlash(text, requireTrailingSpace) {
+    if (!text.startsWith("/")) return null;
+    const rest = text.slice(1);
+    let best = null;
+    for (const s of chatSkills) {
+      if (!s.name) continue;
+      const isExact = rest === s.name;
+      const isPrefix = rest.startsWith(`${s.name} `);
+      if (isExact && requireTrailingSpace) continue;   // could still be extending toward a longer name — wait for the space
+      if ((isExact || isPrefix) && (!best || s.name.length > best.name.length)) best = s;
+    }
+    return best;
+  }
+
+  // Real Claude keeps a sent skill invocation visually distinct INSIDE the
+  // sent message bubble itself (a colored inline token), not just as a chip
+  // that disappears once you hit send. Ours was rendering the sent message
+  // as plain text with no indication a skill had been invoked at all —
+  // reported directly against a side-by-side screenshot of real Claude.
+  // Highlights the leading "/skillname" token the same way the chip does
+  // (indigo) if the text is a recognized invocation; otherwise renders
+  // unchanged.
+  function renderMessageWithSkillTag(text) {
+    if (!text) return text;
+    const matched = matchLeadingSkillSlash(text, false);
+    if (!matched) return text;
+    const tagLen = 1 + matched.name.length;   // "/" + name
+    return (
+      <>
+        <span className="text-indigo-600 font-medium">{text.slice(0, tagLen)}</span>
+        {text.slice(tagLen)}
+      </>
+    );
+  }
+
+  // Skills matching the current "/" filter — same slugify-lite matching as
+  // prompt templates (substring on name), merged into the same dropdown and
+  // capped at 5 so templates still get room in the combined list.
+  const skillMatches = (() => {
+    const f = tplFilter;
+    return chatSkills
+      .filter(s => !f || (s.name || "").toLowerCase().includes(f))
+      .slice(0, 5);
+  })();
+
   // Templates matching the current "/" filter, capped like the render list.
   // Shared by the render and the keyboard-nav handler so Enter selects exactly
   // what the user sees highlighted.
@@ -654,6 +754,17 @@ export default function Chat({
     return templates
       .filter(t => !f || (t.name || "").toLowerCase().includes(f))
       .slice(0, 8);
+  })();
+
+  // Combined, ordered list backing the "/" dropdown's keyboard nav — skills
+  // first (so /skillname takes priority over a same-prefixed template name),
+  // then templates, capped at 8 total entries shown.
+  const slashMenuItems = (() => {
+    const items = [
+      ...skillMatches.map(s => ({ kind: "skill", data: s })),
+      ...tplMatches.map(t => ({ kind: "template", data: t })),
+    ];
+    return items.slice(0, 8);
   })();
 
   useEffect(() => {
@@ -666,6 +777,42 @@ export default function Chat({
   function handleInputChange(e) {
     const v = e.target.value;
     setInput(v);
+
+    // Backspacing a "/skillname " tag out of the input auto-detaches that
+    // skill — matching Claude Desktop (type the tag to attach, delete the
+    // tag to remove). Only applies to the one skill currently represented by
+    // an inserted tag; "+"-picker attachments are untouched by typing.
+    if (slashTaggedSkillId) {
+      const tagged = chatSkills.find(s => s.id === slashTaggedSkillId);
+      const stillTagged = tagged && v.startsWith(`/${tagged.name}`);
+      if (!stillTagged) {
+        removeActiveSkill(slashTaggedSkillId);
+        // fall through — text may still start with "/" for an unrelated
+        // reason, let the generic menu logic below decide.
+      } else {
+        // A skill is already tagged and still intact at the start of the
+        // input — the "/" menu already did its job. Real bug this closes:
+        // every keystroke typed AFTER the tag (e.g. "...what is this")
+        // still starts with "/", so the generic check below kept re-firing
+        // on the WHOLE message text and reopening an empty "no matching
+        // skills" dropdown underneath the already-attached chip.
+        if (tplMenuOpen) setTplMenu(false);
+        return;
+      }
+    } else {
+      // Auto-attach the moment typing completes an exact "/skillname "
+      // match, even without ever opening/picking from the "/" menu — typing
+      // the whole command by hand (like the "/frontend-design what is
+      // this" case that surfaced this gap) must work exactly like clicking
+      // it from the dropdown, matching real Claude Code/Desktop.
+      const typed = matchLeadingSkillSlash(v, /* requireTrailingSpace */ true);
+      if (typed) {
+        attachSkill(typed);
+        setSlashTaggedSkillId(typed.id);
+        setTplMenu(false);
+        return;   // skip the generic "/" menu logic below for this keystroke
+      }
+    }
 
     // Trigger "/" template menu only when slash is the very first character
     // (avoid hijacking mid-sentence slashes like file paths).
@@ -681,6 +828,39 @@ export default function Chat({
   function applyTemplate(tpl) {
     setInput(tpl.body || "");
     setTplMenu(false);
+    setTimeout(() => document.getElementById("chat-input")?.focus(), 0);
+  }
+
+  // Unlike applyTemplate (replaces the whole input), picking a skill from
+  // the "/" menu INSERTS "/skillname " at the start and attaches it as a
+  // chip — matching Hermes-agent's insert-not-replace UX and letting the
+  // user keep typing their actual instruction after the tag. Safe to fully
+  // overwrite `input` here specifically because the "/" menu is only ever
+  // open while the input already IS the in-progress slash command itself
+  // (e.g. "/fro"), not separate message text.
+  function applySkillSlashTag(skill) {
+    setInput(`/${skill.name} `);
+    attachSkill(skill);
+    setSlashTaggedSkillId(skill.id);
+    setTplMenu(false);
+    setTimeout(() => document.getElementById("chat-input")?.focus(), 0);
+  }
+
+  // Attaching via the "+" picker must look and behave exactly like typing
+  // the tag by hand (real Claude doesn't have two different visual results
+  // for the same action) — inserts the same "/skillname " tag, just
+  // PREPENDED to whatever's already typed rather than replacing it,
+  // since (unlike the "/" menu case above) the existing input here is the
+  // user's own message, not a partial slash command. Known limitation: if
+  // a second, different skill is attached via "+" after the first, only
+  // the most recently attached one is tracked for backspace-to-detach —
+  // the earlier tag's text is left in the input as plain text and can
+  // still only be removed via its chip's own "×". Not solved here since
+  // attaching more than one skill at a time hasn't come up in practice.
+  function attachSkillViaPicker(skill) {
+    setInput((prev) => `/${skill.name} ${prev}`);
+    attachSkill(skill);
+    setSlashTaggedSkillId(skill.id);
     setTimeout(() => document.getElementById("chat-input")?.focus(), 0);
   }
 
@@ -2506,6 +2686,20 @@ export default function Chat({
     setLoading(true, chatId);
     // Clear image state immediately so UI feels responsive
     setImageFiles([]);
+    // Attached skill(s) are consumed by this one send, not kept for the rest
+    // of the conversation — matches real Claude Desktop behavior (confirmed
+    // by live testing; supersedes an earlier "persists for the conversation"
+    // assumption in marketplace_skills_plan.md §2.4, corrected after actually
+    // seeing it in the UI). `activeSkillIds` below still reads the pre-clear
+    // value for this send — setState here doesn't mutate this closure's copy.
+    setActiveSkillIds([]);
+    setSlashTaggedSkillId(null);
+    // Pre-existing rough edge (not introduced here, but hit constantly while
+    // testing skill invocation): setInput("") alone doesn't close the "/"
+    // menu, since that only happens inside handleInputChange on a real typing
+    // event — a programmatic clear on send left the menu dangling open with
+    // a stale filter. Same fix benefits the plain prompt-template case too.
+    setTplMenu(false);
 
     // If the user is editing a previous message, trim the history at that point
     // so everything from the edited message onward is discarded before appending.
@@ -2957,6 +3151,17 @@ export default function Chat({
         if (activeTone) body.tone = activeTone;
         const firstName = getFirstName(user);
         if (firstName !== "there") body.user_name = firstName;
+        // Safety net for the case handleInputChange's live auto-attach never
+        // got a chance to fire — e.g. the message was pasted in whole, or
+        // was a bare "/skillname" with no trailing space sent immediately
+        // via Enter. At this point the text is final, so end-of-string is
+        // as valid a boundary as a trailing space.
+        let skillIdsToSend = activeSkillIds;
+        if (skillIdsToSend.length === 0) {
+          const typed = matchLeadingSkillSlash(question, /* requireTrailingSpace */ false);
+          if (typed) skillIdsToSend = [typed.id];
+        }
+        if (skillIdsToSend.length > 0) body.active_skill_ids = skillIdsToSend;
 
         response = await authFetch(`${API}/ask`, {
           method:  "POST",
@@ -4318,9 +4523,11 @@ export default function Chat({
                           from displayed text when attachment metadata is present —
                           the chips/thumbnails below replace it */}
                       <div className="whitespace-pre-wrap">{
-                        msg.attachments?.length > 0
-                          ? stripSystemPrefix(msg.content)?.replace(/\n\n(?:📎|🖼)\s*.+$/, "").trimEnd()
-                          : stripSystemPrefix(msg.content)
+                        renderMessageWithSkillTag(
+                          msg.attachments?.length > 0
+                            ? stripSystemPrefix(msg.content)?.replace(/\n\n(?:📎|🖼)\s*.+$/, "").trimEnd()
+                            : stripSystemPrefix(msg.content)
+                        )
                       }</div>
                       {/* Image attachments: thumbnails rehydrated from the browser
                           preview cache (survive refresh). Only shown when we don't
@@ -5083,36 +5290,72 @@ export default function Chat({
               </div>
             )}
 
-            {/* "/" prompt-template menu */}
-            {tplMenuOpen && templates.length > 0 && (
+            {/* Active skill chips — chat-window-local; persists across sends
+                in this open chat until removed, per the confirmed "persists
+                for the conversation" design. Not sent if empty. */}
+            {activeSkills.length > 0 && (
+              <div className="flex items-center gap-1.5 px-3 pt-2 flex-wrap">
+                {activeSkills.map(s => (
+                  <span key={s.id} className="inline-flex items-center gap-1 pl-2 pr-1 py-0.5 text-[11px] font-medium bg-indigo-50 text-indigo-700 rounded-full border border-indigo-100">
+                    <Zap size={10} />
+                    {s.name}
+                    <button type="button" onClick={() => removeActiveSkill(s.id)} title="Remove skill from this chat" className="p-0.5 hover:bg-indigo-100 rounded-full cursor-pointer">
+                      <X size={10} />
+                    </button>
+                  </span>
+                ))}
+              </div>
+            )}
+
+            {/* "/" menu — skills (installed, manual-invoke) + saved prompt templates */}
+            {tplMenuOpen && (templates.length > 0 || chatSkills.length > 0) && (
                 <div className="absolute bottom-full mb-1 left-2 right-2 bg-white border border-gray-200 rounded-lg shadow-xl max-h-56 overflow-y-auto z-20">
                   <div className="px-3 py-1.5 text-[10px] uppercase tracking-wider text-gray-400 border-b border-gray-100">
-                    Saved prompts {tplFilter && `· "${tplFilter}"`}
+                    Skills &amp; saved prompts {tplFilter && `· "${tplFilter}"`}
                   </div>
-                  {tplMatches.map((t, idx) => (
+                  {slashMenuItems.map((item, idx) => item.kind === "skill" ? (
                           <button
-                              key={t.id}
+                              key={`skill-${item.data.id}`}
                               type="button"
-                              onClick={() => applyTemplate(t)}
+                              onClick={() => applySkillSlashTag(item.data)}
+                              onMouseEnter={() => setTplActiveIdx(idx)}
+                              className={`w-full text-left px-3 py-2 border-b border-gray-100 last:border-b-0 ${
+                                idx === tplActiveIdx ? "bg-indigo-50" : "hover:bg-gray-50"
+                              }`}
+                          >
+                            <div className="text-xs font-medium text-gray-800 truncate flex items-center gap-1.5">
+                              <Zap size={11} className="text-indigo-500 flex-shrink-0" />
+                              {item.data.name}
+                              <span className="px-1 py-0 text-[9px] font-semibold uppercase tracking-wide bg-indigo-50 text-indigo-600 rounded flex-shrink-0">Skill</span>
+                            </div>
+                            <div className="text-[11px] text-gray-500 line-clamp-1">
+                              {item.data.description}
+                            </div>
+                          </button>
+                      ) : (
+                          <button
+                              key={`tpl-${item.data.id}`}
+                              type="button"
+                              onClick={() => applyTemplate(item.data)}
                               onMouseEnter={() => setTplActiveIdx(idx)}
                               className={`w-full text-left px-3 py-2 border-b border-gray-100 last:border-b-0 ${
                                 idx === tplActiveIdx ? "bg-indigo-50" : "hover:bg-gray-50"
                               }`}
                           >
                             <div className="text-xs font-medium text-gray-800 truncate">
-                              {t.name}
-                              {t.scope === "org" && (
+                              {item.data.name}
+                              {item.data.scope === "org" && (
                                   <span className="ml-1 text-[10px] text-gray-400">org</span>
                               )}
                             </div>
                             <div className="text-[11px] text-gray-500 line-clamp-1">
-                              {(t.body || "").slice(0, 120)}
+                              {(item.data.body || "").slice(0, 120)}
                             </div>
                           </button>
                       ))
                   }
-                  {tplMatches.length === 0 && (
-                      <div className="px-3 py-2 text-xs text-gray-400">No matching templates.</div>
+                  {slashMenuItems.length === 0 && (
+                      <div className="px-3 py-2 text-xs text-gray-400">No matching skills or templates.</div>
                   )}
                 </div>
             )}
@@ -5158,24 +5401,31 @@ export default function Chat({
                   }
                 }
 
-                // Phase 5.2: keyboard navigation for the "/" template menu.
-                // ↑/↓ move the highlight; Enter applies the highlighted
-                // template instead of sending. Only active while the menu
-                // is open and has matches.
-                if (tplMenuOpen && tplMatches.length > 0) {
+                // Phase 5.2: keyboard navigation for the "/" menu (skills +
+                // templates, combined). ↑/↓ move the highlight; Enter applies
+                // whichever kind of item is highlighted instead of sending.
+                // Only active while the menu is open and has matches.
+                if (tplMenuOpen && slashMenuItems.length > 0) {
                   if (e.key === "ArrowDown") {
                     e.preventDefault();
-                    setTplActiveIdx(i => (i + 1) % tplMatches.length);
+                    setTplActiveIdx(i => (i + 1) % slashMenuItems.length);
                     return;
                   }
                   if (e.key === "ArrowUp") {
                     e.preventDefault();
-                    setTplActiveIdx(i => (i - 1 + tplMatches.length) % tplMatches.length);
+                    setTplActiveIdx(i => (i - 1 + slashMenuItems.length) % slashMenuItems.length);
                     return;
                   }
-                  if (e.key === "Enter" && !e.shiftKey) {
+                  if ((e.key === "Enter" && !e.shiftKey) || e.key === "Tab") {
+                    // Tab completes the highlighted item the same way Enter
+                    // does here (standard autocomplete convention), but must
+                    // never fall through to "send the message" the way Enter
+                    // does below — Tab moving focus off the textarea entirely
+                    // would be worse than doing nothing.
                     e.preventDefault();
-                    applyTemplate(tplMatches[Math.min(tplActiveIdx, tplMatches.length - 1)]);
+                    const _item = slashMenuItems[Math.min(tplActiveIdx, slashMenuItems.length - 1)];
+                    if (_item.kind === "skill") applySkillSlashTag(_item.data);
+                    else applyTemplate(_item.data);
                     return;
                   }
                 }
@@ -5195,6 +5445,52 @@ export default function Chat({
 
             {/* Toolbar row */}
             <div className="flex items-center gap-1 px-2 pb-2">
+
+              {/* "+" picker — attach an installed Skill to this chat window.
+                  Connectors/Plugins sections are intentionally omitted here:
+                  those tabs have no real backend yet (Phase 1 scope was
+                  Skills-only), so a picker entry for them would be a dead
+                  end. */}
+              <div className="relative">
+                <button
+                  type="button"
+                  onClick={() => { setAttachMenuOpen(v => !v); if (!attachMenuOpen) loadChatSkills(); }}
+                  disabled={inputDisabled}
+                  title="Attach a skill"
+                  className="cursor-pointer p-1.5 text-gray-400 hover:text-gray-600 hover:bg-gray-100 rounded-lg transition disabled:opacity-40"
+                >
+                  <Plus size={16} />
+                </button>
+                {attachMenuOpen && (
+                  <>
+                    <div className="fixed inset-0 z-10" onClick={() => setAttachMenuOpen(false)} />
+                    <div className="absolute bottom-full mb-1 left-0 w-64 bg-white border border-gray-200 rounded-lg shadow-xl max-h-56 overflow-y-auto z-20">
+                      <div className="px-3 py-1.5 text-[10px] uppercase tracking-wider text-gray-400 border-b border-gray-100">
+                        Skills
+                      </div>
+                      {chatSkills.length === 0 && (
+                        <div className="px-3 py-2 text-xs text-gray-400">No installed skills yet — add one from Marketplace.</div>
+                      )}
+                      {chatSkills.map(s => (
+                        <button
+                          key={s.id}
+                          type="button"
+                          onClick={() => attachSkillViaPicker(s)}
+                          disabled={activeSkillIds.includes(s.id)}
+                          className="w-full text-left px-3 py-2 border-b border-gray-100 last:border-b-0 hover:bg-gray-50 disabled:opacity-40 disabled:cursor-default"
+                        >
+                          <div className="text-xs font-medium text-gray-800 truncate flex items-center gap-1.5">
+                            <Zap size={11} className="text-indigo-500 flex-shrink-0" />
+                            {s.name}
+                            {activeSkillIds.includes(s.id) && <span className="text-[10px] text-gray-400">(attached)</span>}
+                          </div>
+                          <div className="text-[11px] text-gray-500 line-clamp-1">{s.description}</div>
+                        </button>
+                      ))}
+                    </div>
+                  </>
+                )}
+              </div>
 
               {/* Attach files */}
               <button

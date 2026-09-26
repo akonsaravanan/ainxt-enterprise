@@ -1162,6 +1162,7 @@ from routers.inbox_router import router as inbox_router
 from routers.mailbox_router import router as mailbox_router
 from routers.projects_router import router as projects_router
 from routers.marketplace_router import router as marketplace_router
+from routers.marketplace_skills_router import router as marketplace_skills_router
 from routers.auth_router import router as auth_router
 from routers.session_router import router as session_router   # DAST fix — concurrent session endpoints
 from routers.notifications_router import router as notifications_router
@@ -1373,6 +1374,7 @@ app.include_router(inbox_router,            prefix="/ainxt/v1/api")
 app.include_router(mailbox_router,          prefix="/ainxt/v1/api")
 app.include_router(projects_router,         prefix="/ainxt/v1/api")
 app.include_router(marketplace_router,      prefix="/ainxt/v1/api")
+app.include_router(marketplace_skills_router, prefix="/ainxt/v1/api")
 app.include_router(auth_router,             prefix="/ainxt/v1/api")
 app.include_router(session_router,          prefix="/ainxt/v1/api")   # DAST fix — concurrent session endpoints
 app.include_router(notifications_router,    prefix="/ainxt/v1/api")
@@ -2188,6 +2190,45 @@ async def startup():
     except Exception as e:
         logger.warning(f"Platform skills seed skipped: {e}")
 
+    try:
+        from routers.marketplace_skills_router import seed_marketplace_skills
+        seed_marketplace_skills()
+        logger.info("Marketplace skills seeded")
+    except Exception as e:
+        logger.warning(f"Marketplace skills seed skipped: {e}")
+
+    # ------------------------------------------------------------
+    # MARKETPLACE SKILLS — EXTERNAL INGESTION (Phase 3)
+    # Seeds the one approved source's config row (still `enabled=False`
+    # until an admin turns it on), then — only if the master env switch is
+    # on — starts a background scheduler that periodically calls
+    # run_ingestion_cycle(). The cycle itself re-checks both the env
+    # per-site flag and the DB row's `enabled` before ever fetching
+    # anything, so this scheduler starting is not itself a trust decision.
+    # ------------------------------------------------------------
+    try:
+        from services.marketplace_skill_ingestion import (
+            seed_marketplace_source_configs, run_ingestion_cycle, INGESTION_SCHEDULER_TICK_MINUTES,
+        )
+        from core.config import MARKETPLACE_SKILL_INGESTION_ENABLED as _MKT_INGEST_ON
+        seed_marketplace_source_configs()
+        if _MKT_INGEST_ON:
+            from apscheduler.schedulers.background import BackgroundScheduler
+            _mkt_sched = BackgroundScheduler(timezone="UTC")
+            # This tick just checks who's due — each source's own
+            # sync_interval_minutes (admin-adjustable) governs when it
+            # actually gets re-fetched, not this interval. See
+            # run_ingestion_cycle()'s docstring.
+            _mkt_sched.add_job(run_ingestion_cycle, trigger="interval",
+                                minutes=INGESTION_SCHEDULER_TICK_MINUTES, id="marketplace_skill_ingestion")
+            _mkt_sched.start()
+            logger.info(f"Marketplace skill ingestion scheduler started ({INGESTION_SCHEDULER_TICK_MINUTES}min check tick; "
+                        f"actual fetch cadence is each source's own sync_interval_minutes)")
+        else:
+            logger.info("Marketplace skill ingestion disabled (MARKETPLACE_SKILL_INGESTION_ENABLED=false)")
+    except Exception as e:
+        logger.warning(f"Marketplace skill ingestion setup skipped: {e}")
+
     # ------------------------------------------------------------
     # SEED AiNxt DOMAIN SKILLS + AGENT TEMPLATES (idempotent)
     # Seeds on every startup — upserts only, never overwrites custom changes.
@@ -2548,6 +2589,7 @@ class Question(BaseModel):
     kb_doc_ids:     Optional[List[str]] = None  # KB disambig: user-selected doc UUIDs from DocPickerCard (multi-select re-query)
     ephemeral:      bool               = False  # True = skip chat-history Kafka produce. Used by frontend intent classifier to avoid polluting the sidebar with orphan chats.
     mode:           Optional[str]      = None   # UI surface: None/"chat" (default) | "office" (Cowork — connector/KB-aware planner persona)
+    active_skill_ids: Optional[List[str]] = []  # Marketplace skill ids explicitly invoked via /skillname or the "+" picker (see routers/marketplace_skills_router.py) — manual-only for v1, not model-auto-invoked
 
 
 def _save_chat_messages(chat_id: str, user_id: str, question: str, answer: str,
@@ -5653,6 +5695,49 @@ async def ask_ai(q: Question, request: Request, authorization: Optional[str] = _
         except Exception as _ag_err:
             logger.warning(f"Agent context lookup failed: {_ag_err}")
 
+    # ========================================================
+    # STEP 0b3: MARKETPLACE SKILL CONTEXT LOOKUP (no injection yet)
+    # Manual-only for v1 (Phase 2 of the Marketplace Skills plan) — the model
+    # never auto-invokes a skill; the client sends the id(s) it explicitly
+    # invoked via /skillname or the "+" picker. Re-verified server-side on
+    # every request (not just at install time): the caller must currently
+    # have the skill installed, and it must not have been blocked since —
+    # a skill deleted or blocked after being attached in an open chat window
+    # simply stops resolving here, no client-side trust required. Injected
+    # AFTER the compliance gate below (STEP 1a), same reasoning as the agent
+    # system prompt above.
+    # ========================================================
+    _skills_system_prompt = None
+    if q.active_skill_ids:
+        try:
+            from db.database import SessionLocal as _SkDB
+            from db.models import MarketplaceSkillRecord as _SkRec, MarketplaceSkillInstallRecord as _SkInstall
+            from services.marketplace_skill_ingestion import is_mit_compatible_license as _sk_license_ok
+            _skdb = _SkDB()
+            try:
+                _installed_skill_ids = {
+                    row[0] for row in _skdb.query(_SkInstall.skill_id).filter(
+                        _SkInstall.user_id == _user_id,
+                        _SkInstall.skill_id.in_(q.active_skill_ids),
+                    ).all()
+                }
+                _skill_blocks = []
+                for _sid in q.active_skill_ids:
+                    if _sid not in _installed_skill_ids:
+                        continue  # not installed by this user (or deleted since) — skip, don't error the whole request
+                    _skrec = _skdb.query(_SkRec).filter(_SkRec.id == _sid).first()
+                    if not _skrec or _skrec.security_status == "blocked":
+                        continue
+                    if _skrec.third_party and _skrec.source != "internal" and not _sk_license_ok(_skrec.license):
+                        continue  # license re-classified as incompatible since install — same re-check as the install endpoint; source="internal" (demo seed skills) exempt, same as the install endpoint's own check
+                    _skill_blocks.append(f"### Skill: {_skrec.name}\n{_skrec.instructions}")
+                if _skill_blocks:
+                    _skills_system_prompt = "\n\n".join(_skill_blocks)
+            finally:
+                _skdb.close()
+        except Exception as _sk_err:
+            logger.warning(f"Skill context lookup failed: {_sk_err}")
+
     # ── Cowork office persona ────────────────────────────────────────────────
     # When the request comes from the Cowork tab (mode="office") and no specific
     # agent persona is set, frame the assistant as a non-technical office helper.
@@ -6110,18 +6195,51 @@ async def ask_ai(q: Question, request: Request, authorization: Optional[str] = _
     #   2. The LLM still receives the full agent context (system prompt + question)
     #   3. safe_question (used for storage/retrieval) includes the agent context
     # ========================================================
-    if _agent_system_prompt:
+    if _agent_system_prompt or _skills_system_prompt:
+        _prefix_blocks = []
+        if _agent_system_prompt:
+            _prefix_blocks.append(f"[AGENT INSTRUCTIONS — follow exactly]\n{_agent_system_prompt}")
+        if _skills_system_prompt:
+            # Manual-only invocation (plan §2 — the model never auto-picks a
+            # skill; the user explicitly typed /skillname or picked it from
+            # the "+" menu for THIS message). "Apply if relevant" therefore
+            # contradicts the whole point of manual invocation — the user's
+            # explicit choice already settled relevance; hedging language
+            # here just gives the model an easy way to silently ignore a
+            # skill someone deliberately attached. Confirmed as a real
+            # problem by direct testing: a skill whose own content is
+            # written cautiously ("only recommend on strong matches",
+            # "silence is better than noise") was being computed and
+            # correctly included in the prompt every time, but never
+            # visibly affected the answer — the model was reading "if
+            # relevant" as license to skip a skill that itself already
+            # hedges on doing anything.
+            _prefix_blocks.append(f"[ACTIVE SKILL — the user explicitly invoked this skill for this message; follow its instructions below as the primary guide for your response]\n{_skills_system_prompt}")
         original = (
-            f"[AGENT INSTRUCTIONS — follow exactly]\n{_agent_system_prompt}\n\n"
-            f"[USER QUESTION]\n{original}"
+            "\n\n".join(_prefix_blocks) + f"\n\n[USER QUESTION]\n{original}"
         )
-        # Re-derive safe_question from the updated original (with agent prompt)
+        # Re-derive safe_question from the updated original (with agent/skill
+        # prompt). REAL BUG, found by tracing + a real A/B test: this used to
+        # be `_ask_chk.get("redacted_text") or original` / `... or mask_pii(original)`.
+        # `_ask_chk` was computed via validate_input(original) BEFORE this
+        # prefix ever existed (on the raw user question alone), and
+        # validate_input() ALWAYS returns a non-empty redacted_text (even
+        # with nothing to redact, it just echoes the input back) — so that
+        # `or` never once fell through to the prefix-including value, and
+        # every agent/skill system prompt silently vanished before ever
+        # reaching the model. Confirmed with a controlled test: the same
+        # question, with vs. without a skill attached, produced
+        # statistically-identical answers with zero trace of the skill's
+        # specific content. Fix: never fall back to the stale pre-prefix
+        # redaction result once a prefix has been added — redact/pass
+        # through the FRESH `original` (which already includes the prefix)
+        # instead.
         if _bypass_safety_filters:
             safe_question = original
         elif q.cli_mode:
-            safe_question = _ask_chk.get("redacted_text") or original
+            safe_question = original
         else:
-            safe_question = _ask_chk.get("redacted_text") or mask_pii(original)
+            safe_question = mask_pii(original)
 
     # ── Persona / tone injection ──────────────────────────────
     # _tone_pfx is applied ONLY to _question_with_history (the LLM prompt).
@@ -9365,7 +9483,15 @@ async def ask_ai(q: Question, request: Request, authorization: Optional[str] = _
                 and not _model_hint
                 and not _kb_doc_already_selected
                 and not _is_followup
-                and not _has_history):
+                and not _has_history
+                # Explicitly attaching a skill (/skillname or the "+" picker —
+                # STEP 0b3 above) is an unambiguous intent signal, the same
+                # in spirit as _model_hint above: the user picked a specific
+                # skill on purpose, so a heuristic "this message looks vague"
+                # classifier shouldn't second-guess that and return a canned
+                # clarification that never even reaches the LLM (let alone
+                # the skill instructions already resolved above).
+                and not q.active_skill_ids):
             _clar_msg = (
                 "I'm not sure what you'd like me to do — could you give me a bit "
                 "more detail? For example, what topic or task you have in mind."
